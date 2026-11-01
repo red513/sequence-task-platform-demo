@@ -1,0 +1,22 @@
+import http from 'node:http';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { Store,datasets,operations,sourceRows,publicTask,csv } from './store.mjs';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+function json(res,status,data){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data));}
+async function body(req){let s='';for await(const chunk of req){s+=chunk;if(s.length>20000)throw Object.assign(new Error('请求内容过大。'),{status:413});}try{return JSON.parse(s||'{}');}catch{throw Object.assign(new Error('JSON 格式不正确。'),{status:400});}}
+export function createServer(store){return http.createServer(async(req,res)=>{try{const u=new URL(req.url,'http://localhost'),p=u.pathname,method=req.method;
+ if(p.startsWith('/api/')&&method!=='GET'){const origin=req.headers.origin;if(origin){let host;try{host=new URL(origin).hostname;}catch{}if(!['localhost','127.0.0.1'].includes(host))return json(res,403,{message:'仅接受本机请求。'});}}
+ if(p==='/api/health'&&method==='GET')return json(res,200,{ok:true,mode:'local-demo',worker:'serial',storage:'json'});
+ if(p==='/api/datasets'&&method==='GET')return json(res,200,{items:datasets,operations});
+ if(/^\/api\/datasets\/[^/]+$/.test(p)&&method==='GET'){const id=p.split('/').at(-1),d=datasets.find(d=>d.id===id);if(!d)return json(res,404,{message:'数据集不存在。'});return json(res,200,{...d,rows:sourceRows(id).slice(0,8)});}
+ if(p==='/api/activity'&&method==='GET')return json(res,200,{items:store.activity.slice(0,60)});
+ if(p==='/api/tasks'&&method==='GET'){const q=(u.searchParams.get('q')||'').trim().toLowerCase(),status=u.searchParams.get('status')||'all',operation=u.searchParams.get('operation')||'all';let tasks=store.tasks.filter(t=>(status==='all'||t.status===status)&&(operation==='all'||t.operation===operation)&&(!q||`${t.name} ${t.id}`.toLowerCase().includes(q)));const pageSize=Math.min(25,Math.max(5,Number(u.searchParams.get('pageSize'))||8)),total=tasks.length,pages=Math.max(1,Math.ceil(total/pageSize)),page=Math.min(pages,Math.max(1,Number(u.searchParams.get('page'))||1));return json(res,200,{items:tasks.slice((page-1)*pageSize,page*pageSize).map(t=>publicTask(t)),total,page,pageSize,pages,summary:store.summary()});}
+ if(p==='/api/tasks'&&method==='POST')return json(res,201,{task:publicTask(store.create(await body(req)),true)});
+ const match=p.match(/^\/api\/tasks\/([^/]+)(?:\/(retry|cancel|result))?$/);if(match){const[,id,action]=match;if(!action&&method==='GET')return json(res,200,{task:publicTask(store.find(id),true)});if(method==='POST'&&action==='retry')return json(res,200,{task:publicTask(store.retry(id),true)});if(method==='POST'&&action==='cancel')return json(res,200,{task:publicTask(store.cancel(id),true)});if(method==='GET'&&action==='result'){const t=store.find(id);if(t.status!=='succeeded')return json(res,409,{message:'任务尚未成功，暂无结果文件。'});res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="${t.id}-result.csv"`,'Cache-Control':'no-store'});return res.end(csv(t.result));}}
+ if(p.startsWith('/api/'))return json(res,404,{message:'接口不存在。'});
+ if(method==='GET'){const requested=p==='/'?'/index.html':p;let f=path.resolve(root,'dist','.'+requested);const dist=path.join(root,'dist')+path.sep;if(!f.startsWith(dist))return json(res,403,{message:'无效路径。'});if(!fs.existsSync(f)||!fs.statSync(f).isFile())f=path.join(root,'dist/index.html');if(!fs.existsSync(f))return json(res,404,{message:'开发时请打开 http://127.0.0.1:18750；生产预览需先运行 npm run build。'});const ext=path.extname(f);res.writeHead(200,{'Content-Type':({'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml'})[ext]||'application/octet-stream'});return fs.createReadStream(f).pipe(res);}
+ return json(res,405,{message:'不支持的操作。'});
+ }catch(e){return json(res,e.status||500,{message:e.status?e.message:'服务暂时不可用，请稍后重试。',field:e.field});}});}
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){const store=new Store(process.env.TASK_DATA_FILE||path.join(root,'var/tasks.json')).start();const server=createServer(store);const port=Number(process.env.API_PORT)||18751;server.listen(port,'127.0.0.1',()=>console.log(`API & production preview: http://127.0.0.1:${port}`));const stop=()=>{store.stop();server.close(()=>process.exit(0));};process.on('SIGINT',stop);process.on('SIGTERM',stop);}
